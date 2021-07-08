@@ -17,53 +17,87 @@
 #if defined(OPENSSL_PTHREADS)
 
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <openssl/mem.h>
 #include <openssl/type_check.h>
 
+#define atomic_xadd(P, V) __sync_fetch_and_add((P), (V))
+#define cmpxchg(P, O, N) __sync_val_compare_and_swap((P), (O), (N))
+#define atomic_inc(P) __sync_add_and_fetch((P), 1)
+#define atomic_dec(P) __sync_add_and_fetch((P), -1)
+#define atomic_add(P, V) __sync_add_and_fetch((P), (V))
+#define atomic_set_bit(P, V) __sync_or_and_fetch((P), 1 << (V))
+#define atomic_clear_bit(P, V) __sync_and_and_fetch((P), ~(1 << (V)))
 
-OPENSSL_STATIC_ASSERT(sizeof(CRYPTO_MUTEX) >= sizeof(pthread_rwlock_t),
+#define EBUSY 1
+
+/* Compile read-write barrier */
+#define barrier() __asm__ volatile("" : : : "memory")
+
+/* Pause instruction to prevent excess processor bus usage */
+#define cpu_relax() __asm__ volatile("pause\n" : : : "memory")
+
+
+typedef union ticketlock ticketlock;
+
+union ticketlock {
+  unsigned u;
+  struct {
+    unsigned short ticket;
+    unsigned short users;
+  } s;
+};
+
+typedef struct {
+  pthread_mutex_t _mutex;
+  bool _ran;
+} true_pthread_once_t;
+
+
+static void ticket_lock(ticketlock *t) {
+  unsigned short me = atomic_xadd(&t->s.users, 1);
+
+  while (t->s.ticket != me)
+    cpu_relax();
+}
+
+static void ticket_unlock(ticketlock *t) {
+  barrier();
+  t->s.ticket++;
+}
+
+OPENSSL_STATIC_ASSERT(sizeof(CRYPTO_MUTEX) >= sizeof(ticketlock),
                       "CRYPTO_MUTEX is too small");
 #if defined(__GNUC__) || defined(__clang__)
-OPENSSL_STATIC_ASSERT(alignof(CRYPTO_MUTEX) >= alignof(pthread_rwlock_t),
+OPENSSL_STATIC_ASSERT(alignof(CRYPTO_MUTEX) >= alignof(ticketlock),
                       "CRYPTO_MUTEX has insufficient alignment");
 #endif
 
 void CRYPTO_MUTEX_init(CRYPTO_MUTEX *lock) {
-  if (pthread_rwlock_init((pthread_rwlock_t *) lock, NULL) != 0) {
-    abort();
-  }
+  ticketlock *temp = ((ticketlock *)lock);
+  temp->u = 0;
 }
 
 void CRYPTO_MUTEX_lock_read(CRYPTO_MUTEX *lock) {
-  if (pthread_rwlock_rdlock((pthread_rwlock_t *) lock) != 0) {
-    abort();
-  }
+  ticket_lock((ticketlock *)lock);
 }
 
 void CRYPTO_MUTEX_lock_write(CRYPTO_MUTEX *lock) {
-  if (pthread_rwlock_wrlock((pthread_rwlock_t *) lock) != 0) {
-    abort();
-  }
+  ticket_lock((ticketlock *)lock);
 }
 
 void CRYPTO_MUTEX_unlock_read(CRYPTO_MUTEX *lock) {
-  if (pthread_rwlock_unlock((pthread_rwlock_t *) lock) != 0) {
-    abort();
-  }
+  ticket_unlock((ticketlock *)lock);
 }
 
 void CRYPTO_MUTEX_unlock_write(CRYPTO_MUTEX *lock) {
-  if (pthread_rwlock_unlock((pthread_rwlock_t *) lock) != 0) {
-    abort();
-  }
+  ticket_unlock((ticketlock *)lock);
 }
 
-void CRYPTO_MUTEX_cleanup(CRYPTO_MUTEX *lock) {
-  pthread_rwlock_destroy((pthread_rwlock_t *) lock);
-}
+void CRYPTO_MUTEX_cleanup(CRYPTO_MUTEX *lock) {}
 
 void CRYPTO_STATIC_MUTEX_lock_read(struct CRYPTO_STATIC_MUTEX *lock) {
   if (pthread_rwlock_rdlock(&lock->lock) != 0) {
@@ -90,9 +124,17 @@ void CRYPTO_STATIC_MUTEX_unlock_write(struct CRYPTO_STATIC_MUTEX *lock) {
 }
 
 void CRYPTO_once(CRYPTO_once_t *once, void (*init)(void)) {
+  static ticketlock lock = {.u = 0};
+
+  if (((true_pthread_once_t *)once)->_ran) {
+    return;
+  }
+
+  ticket_lock(&lock);
   if (pthread_once(once, init) != 0) {
     abort();
   }
+  ticket_unlock(&lock);
 }
 
 static pthread_mutex_t g_destructors_lock = PTHREAD_MUTEX_INITIALIZER;
