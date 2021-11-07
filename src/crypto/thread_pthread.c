@@ -126,7 +126,7 @@ void CRYPTO_STATIC_MUTEX_unlock_write(struct CRYPTO_STATIC_MUTEX *lock) {
 void CRYPTO_once(CRYPTO_once_t *once, void (*init)(void)) {
   static ticketlock lock = {.u = 0};
 
-  if (((true_pthread_once_t *)once)->_ran) {
+  if (once->_ran) {
     return;
   }
 
