@@ -16,13 +16,13 @@
 
 #if defined(OPENSSL_PTHREADS)
 
+#include <assert.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <openssl/mem.h>
-#include <openssl/type_check.h>
 
 #define atomic_xadd(P, V) __sync_fetch_and_add((P), (V))
 #define cmpxchg(P, O, N) __sync_val_compare_and_swap((P), (O), (N))
@@ -48,7 +48,7 @@ union ticketlock {
   struct {
     unsigned short ticket;
     unsigned short users;
-  } s;
+  }
 };
 
 typedef struct {

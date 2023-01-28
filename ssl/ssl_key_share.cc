@@ -206,7 +206,10 @@ class CECPQ2KeyShare : public SSLKeyShare {
     uint8_t hrss_entropy[HRSS_GENERATE_KEY_BYTES];
     HRSS_public_key hrss_public_key;
     RAND_bytes(hrss_entropy, sizeof(hrss_entropy));
-    HRSS_generate_key(&hrss_public_key, &hrss_private_key_, hrss_entropy);
+    if (!HRSS_generate_key(&hrss_public_key, &hrss_private_key_,
+                           hrss_entropy)) {
+      return false;
+    }
 
     uint8_t hrss_public_key_bytes[HRSS_PUBLIC_KEY_BYTES];
     HRSS_marshal_public_key(hrss_public_key_bytes, &hrss_public_key);
@@ -243,9 +246,10 @@ class CECPQ2KeyShare : public SSLKeyShare {
     uint8_t ciphertext[HRSS_CIPHERTEXT_BYTES];
     uint8_t entropy[HRSS_ENCAP_BYTES];
     RAND_bytes(entropy, sizeof(entropy));
-    HRSS_encap(ciphertext, secret.data() + 32, &peer_public_key, entropy);
 
-    if (!CBB_add_bytes(out_public_key, x25519_public_key,
+    if (!HRSS_encap(ciphertext, secret.data() + 32, &peer_public_key,
+                    entropy) ||
+        !CBB_add_bytes(out_public_key, x25519_public_key,
                        sizeof(x25519_public_key)) ||
         !CBB_add_bytes(out_public_key, ciphertext, sizeof(ciphertext))) {
       return false;
@@ -272,8 +276,10 @@ class CECPQ2KeyShare : public SSLKeyShare {
       return false;
     }
 
-    HRSS_decap(secret.data() + 32, &hrss_private_key_, peer_key.data() + 32,
-               peer_key.size() - 32);
+    if (!HRSS_decap(secret.data() + 32, &hrss_private_key_,
+                    peer_key.data() + 32, peer_key.size() - 32)) {
+      return false;
+    }
 
     *out_secret = std::move(secret);
     return true;
@@ -284,13 +290,64 @@ class CECPQ2KeyShare : public SSLKeyShare {
   HRSS_private_key hrss_private_key_;
 };
 
-CONSTEXPR_ARRAY NamedGroup kNamedGroups[] = {
+class X25519Kyber768KeyShare : public SSLKeyShare {
+ public:
+  X25519Kyber768KeyShare() {}
+
+  uint16_t GroupID() const override { return SSL_CURVE_X25519KYBER768; }
+
+  bool Offer(CBB *out) override {
+    // There is no implementation on Kyber in BoringSSL. BoringSSL must be
+    // patched for this key agreement to be workable. It is not enabled by
+    // default.
+    return false;
+  }
+
+  bool Accept(CBB *out_public_key, Array<uint8_t> *out_secret,
+              uint8_t *out_alert, Span<const uint8_t> peer_key) override {
+    return false;
+  }
+
+  bool Finish(Array<uint8_t> *out_secret, uint8_t *out_alert,
+              Span<const uint8_t> peer_key) override {
+    return false;
+  }
+};
+
+class P256Kyber768KeyShare : public SSLKeyShare {
+ public:
+  P256Kyber768KeyShare() {}
+
+  uint16_t GroupID() const override { return SSL_CURVE_P256KYBER768; }
+
+  bool Offer(CBB *out) override {
+    // There is no implementation on Kyber in BoringSSL. BoringSSL must be
+    // patched for this key agreement to be workable. It is not enabled by
+    // default.
+    return false;
+  }
+
+  bool Accept(CBB *out_public_key, Array<uint8_t> *out_secret,
+              uint8_t *out_alert, Span<const uint8_t> peer_key) override {
+    return false;
+  }
+
+  bool Finish(Array<uint8_t> *out_secret, uint8_t *out_alert,
+              Span<const uint8_t> peer_key) override {
+    return false;
+  }
+};
+
+constexpr NamedGroup kNamedGroups[] = {
     {NID_secp224r1, SSL_CURVE_SECP224R1, "P-224", "secp224r1"},
     {NID_X9_62_prime256v1, SSL_CURVE_SECP256R1, "P-256", "prime256v1"},
     {NID_secp384r1, SSL_CURVE_SECP384R1, "P-384", "secp384r1"},
     {NID_secp521r1, SSL_CURVE_SECP521R1, "P-521", "secp521r1"},
     {NID_X25519, SSL_CURVE_X25519, "X25519", "x25519"},
     {NID_CECPQ2, SSL_CURVE_CECPQ2, "CECPQ2", "CECPQ2"},
+    {NID_X25519Kyber768, SSL_CURVE_X25519KYBER768, "X25519KYBER",
+     "X25519Kyber"},
+    {NID_P256Kyber768, SSL_CURVE_P256KYBER768, "P256KYBER", "P256Kyber"},
 };
 
 }  // namespace
@@ -302,21 +359,21 @@ Span<const NamedGroup> NamedGroups() {
 UniquePtr<SSLKeyShare> SSLKeyShare::Create(uint16_t group_id) {
   switch (group_id) {
     case SSL_CURVE_SECP224R1:
-      return UniquePtr<SSLKeyShare>(
-          New<ECKeyShare>(NID_secp224r1, SSL_CURVE_SECP224R1));
+      return MakeUnique<ECKeyShare>(NID_secp224r1, SSL_CURVE_SECP224R1);
     case SSL_CURVE_SECP256R1:
-      return UniquePtr<SSLKeyShare>(
-          New<ECKeyShare>(NID_X9_62_prime256v1, SSL_CURVE_SECP256R1));
+      return MakeUnique<ECKeyShare>(NID_X9_62_prime256v1, SSL_CURVE_SECP256R1);
     case SSL_CURVE_SECP384R1:
-      return UniquePtr<SSLKeyShare>(
-          New<ECKeyShare>(NID_secp384r1, SSL_CURVE_SECP384R1));
+      return MakeUnique<ECKeyShare>(NID_secp384r1, SSL_CURVE_SECP384R1);
     case SSL_CURVE_SECP521R1:
-      return UniquePtr<SSLKeyShare>(
-          New<ECKeyShare>(NID_secp521r1, SSL_CURVE_SECP521R1));
+      return MakeUnique<ECKeyShare>(NID_secp521r1, SSL_CURVE_SECP521R1);
     case SSL_CURVE_X25519:
-      return UniquePtr<SSLKeyShare>(New<X25519KeyShare>());
+      return MakeUnique<X25519KeyShare>();
     case SSL_CURVE_CECPQ2:
-      return UniquePtr<SSLKeyShare>(New<CECPQ2KeyShare>());
+      return MakeUnique<CECPQ2KeyShare>();
+    case SSL_CURVE_X25519KYBER768:
+      return MakeUnique<X25519Kyber768KeyShare>();
+    case SSL_CURVE_P256KYBER768:
+      return MakeUnique<P256Kyber768KeyShare>();
     default:
       return nullptr;
   }

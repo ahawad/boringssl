@@ -127,12 +127,7 @@ static void bio_destroy_pair(BIO *bio) {
 }
 
 static int bio_free(BIO *bio) {
-  struct bio_bio_st *b;
-
-  if (bio == NULL) {
-    return 0;
-  }
-  b = bio->ptr;
+  struct bio_bio_st *b = bio->ptr;
 
   assert(b != NULL);
 
@@ -484,5 +479,5 @@ size_t BIO_ctrl_get_write_guarantee(BIO *bio) {
 }
 
 int BIO_shutdown_wr(BIO *bio) {
-  return BIO_ctrl(bio, BIO_C_SHUTDOWN_WR, 0, NULL);
+  return (int)BIO_ctrl(bio, BIO_C_SHUTDOWN_WR, 0, NULL);
 }

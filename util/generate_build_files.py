@@ -25,16 +25,18 @@ import json
 
 # OS_ARCH_COMBOS maps from OS and platform to the OpenSSL assembly "style" for
 # that platform and the extension used by asm files.
+#
+# TODO(https://crbug.com/boringssl/524): This probably should be a map, but some
+# downstream scripts import this to find what folders to add/remove from git.
 OS_ARCH_COMBOS = [
-    ('ios', 'arm', 'ios32', [], 'S'),
-    ('ios', 'aarch64', 'ios64', [], 'S'),
+    ('apple', 'arm', 'ios32', [], 'S'),
+    ('apple', 'aarch64', 'ios64', [], 'S'),
+    ('apple', 'x86', 'macosx', ['-fPIC', '-DOPENSSL_IA32_SSE2'], 'S'),
+    ('apple', 'x86_64', 'macosx', [], 'S'),
     ('linux', 'arm', 'linux32', [], 'S'),
     ('linux', 'aarch64', 'linux64', [], 'S'),
-    ('linux', 'ppc64le', 'linux64le', [], 'S'),
     ('linux', 'x86', 'elf', ['-fPIC', '-DOPENSSL_IA32_SSE2'], 'S'),
     ('linux', 'x86_64', 'elf', [], 'S'),
-    ('mac', 'x86', 'macosx', ['-fPIC', '-DOPENSSL_IA32_SSE2'], 'S'),
-    ('mac', 'x86_64', 'macosx', [], 'S'),
     ('win', 'x86', 'win32n', ['-DOPENSSL_IA32_SSE2'], 'asm'),
     ('win', 'x86_64', 'nasm', [], 'asm'),
     ('win', 'aarch64', 'win64', [], 'S'),
@@ -47,9 +49,6 @@ NON_PERL_FILES = {
         'src/crypto/curve25519/asm/x25519-asm-arm.S',
         'src/crypto/poly1305/poly1305_arm_asm.S',
     ],
-    ('linux', 'x86_64'): [
-        'src/crypto/hrss/asm/poly_rq_mul.S',
-    ],
 }
 
 PREFIX = None
@@ -60,24 +59,35 @@ def PathOf(x):
   return x if not PREFIX else os.path.join(PREFIX, x)
 
 
+LICENSE_TEMPLATE = """Copyright (c) 2015, Google Inc.
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
+SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION
+OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.""".split("\n")
+
+def LicenseHeader(comment):
+  lines = []
+  for line in LICENSE_TEMPLATE:
+    if not line:
+      lines.append(comment)
+    else:
+      lines.append("%s %s" % (comment, line))
+  lines.append("")
+  return "\n".join(lines)
+
+
 class Android(object):
 
   def __init__(self):
-    self.header = \
-"""# Copyright (C) 2015 The Android Open Source Project
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+    self.header = LicenseHeader("#") + """
 # This file is created by generate_build_files.py. Do not edit manually.
 """
 
@@ -131,7 +141,7 @@ class Android(object):
     if asm_outputs:
       blueprint.write('    target: {\n')
       for ((osname, arch), asm_files) in asm_outputs:
-        if osname != 'linux' or arch == 'ppc64le':
+        if osname != 'linux':
           continue
         if arch == 'aarch64':
           arch = 'arm64'
@@ -156,6 +166,9 @@ class Android(object):
     Returns:
       A copy of |asm| with files filtered according to |want_bcm|
     """
+    # TODO(https://crbug.com/boringssl/542): Rather than filtering by filename,
+    # use the variable listed in the CMake perlasm line, available in
+    # ExtractPerlAsmFromCMakeFile.
     return [(archinfo, filter(lambda p: ("/crypto/fipsmodule/" in p) == want_bcm, files))
             for (archinfo, files) in asm]
 
@@ -163,21 +176,7 @@ class Android(object):
 class AndroidCMake(object):
 
   def __init__(self):
-    self.header = \
-"""# Copyright (C) 2019 The Android Open Source Project
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+    self.header = LicenseHeader("#") + """
 # This file is created by generate_build_files.py. Do not edit manually.
 # To specify a custom path prefix, set BORINGSSL_ROOT before including this
 # file, or use list(TRANSFORM ... PREPEND) from CMake 3.12.
@@ -282,21 +281,7 @@ class Bazel(object):
 class Eureka(object):
 
   def __init__(self):
-    self.header = \
-"""# Copyright (C) 2017 The Android Open Source Project
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+    self.header = LicenseHeader("#") + """
 # This file is created by generate_build_files.py. Do not edit manually.
 
 """
@@ -327,11 +312,7 @@ class GN(object):
 
   def __init__(self):
     self.firstSection = True
-    self.header = \
-"""# Copyright (c) 2016 The Chromium Authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE file.
-
+    self.header = LicenseHeader("#") + """
 # This file is created by generate_build_files.py. Do not edit manually.
 
 """
@@ -386,11 +367,7 @@ class GN(object):
 class GYP(object):
 
   def __init__(self):
-    self.header = \
-"""# Copyright (c) 2016 The Chromium Authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE file.
-
+    self.header = LicenseHeader("#") + """
 # This file is created by generate_build_files.py. Do not edit manually.
 
 """
@@ -421,11 +398,7 @@ class GYP(object):
 class CMake(object):
 
   def __init__(self):
-    self.header = \
-R'''# Copyright (c) 2019 The Chromium Authors. All rights reserved.
-# Use of this source code is governed by a BSD-style license that can be
-# found in the LICENSE file.
-
+    self.header = LicenseHeader("#") + R'''
 # This file is created by generate_build_files.py. Do not edit manually.
 
 cmake_minimum_required(VERSION 3.5)
@@ -437,11 +410,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CLANG)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -fvisibility=hidden -fno-common -fno-exceptions -fno-rtti")
-  if(APPLE)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
-  endif()
-
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++14 -fvisibility=hidden -fno-common -fno-exceptions -fno-rtti")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fvisibility=hidden -fno-common -std=c11")
 endif()
 
@@ -472,7 +441,7 @@ add_definitions(-DBORINGSSL_IMPLEMENTATION)
 # builds.
 if(NOT OPENSSL_NO_ASM AND CMAKE_OSX_ARCHITECTURES)
   list(LENGTH CMAKE_OSX_ARCHITECTURES NUM_ARCHES)
-  if(NOT ${NUM_ARCHES} EQUAL 1)
+  if(NOT NUM_ARCHES EQUAL 1)
     message(FATAL_ERROR "Universal binaries not supported.")
   endif()
   list(GET CMAKE_OSX_ARCHITECTURES 0 CMAKE_SYSTEM_PROCESSOR)
@@ -481,37 +450,35 @@ endif()
 if(OPENSSL_NO_ASM)
   add_definitions(-DOPENSSL_NO_ASM)
   set(ARCH "generic")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
   set(ARCH "x86_64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "amd64")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "amd64")
   set(ARCH "x86_64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "AMD64")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "AMD64")
   # cmake reports AMD64 on Windows, but we might be building for 32-bit.
   if(CMAKE_SIZEOF_VOID_P EQUAL 8)
     set(ARCH "x86_64")
   else()
     set(ARCH "x86")
   endif()
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "x86")
   set(ARCH "x86")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i386")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "i386")
   set(ARCH "x86")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i686")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "i686")
   set(ARCH "x86")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64")
   set(ARCH "aarch64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
   set(ARCH "aarch64")
 # Apple A12 Bionic chipset which is added in iPhone XS/XS Max/XR uses arm64e architecture.
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64e")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64e")
   set(ARCH "aarch64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^arm*")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^arm*")
   set(ARCH "arm")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "mips")
+elseif(CMAKE_SYSTEM_PROCESSOR STREQUAL "mips")
   # Just to avoid the “unknown processor” error.
   set(ARCH "generic")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "ppc64le")
-  set(ARCH "ppc64le")
 else()
   message(FATAL_ERROR "Unknown processor:" ${CMAKE_SYSTEM_PROCESSOR})
 endif()
@@ -586,12 +553,8 @@ include_directories(src/include)
             asm_files)
 
       cmake.write(
-R'''if(APPLE AND ${ARCH} STREQUAL "aarch64")
-  set(CRYPTO_ARCH_SOURCES ${CRYPTO_ios_aarch64_SOURCES})
-elseif(APPLE AND ${ARCH} STREQUAL "arm")
-  set(CRYPTO_ARCH_SOURCES ${CRYPTO_ios_arm_SOURCES})
-elseif(APPLE)
-  set(CRYPTO_ARCH_SOURCES ${CRYPTO_mac_${ARCH}_SOURCES})
+R'''if(APPLE)
+  set(CRYPTO_ARCH_SOURCES ${CRYPTO_apple_${ARCH}_SOURCES})
 elseif(UNIX)
   set(CRYPTO_ARCH_SOURCES ${CRYPTO_linux_${ARCH}_SOURCES})
 elseif(WIN32)
@@ -736,12 +699,12 @@ def ExtractPerlAsmFromCMakeFile(cmakefile):
         raise ValueError('Bad perlasm line in %s' % cmakefile)
       # Remove "perlasm(" from start and ")" from end
       params = line[8:-1].split()
-      if len(params) < 2:
+      if len(params) != 4:
         raise ValueError('Bad perlasm line in %s' % cmakefile)
       perlasms.append({
-          'extra_args': params[2:],
-          'input': os.path.join(os.path.dirname(cmakefile), params[1]),
-          'output': os.path.join(os.path.dirname(cmakefile), params[0]),
+          'arch': params[1],
+          'output': os.path.join(os.path.dirname(cmakefile), params[2]),
+          'input': os.path.join(os.path.dirname(cmakefile), params[3]),
       })
 
   return perlasms
@@ -768,51 +731,28 @@ def PerlAsm(output_filename, input_filename, perlasm_style, extra_args):
       ['perl', input_filename, perlasm_style] + extra_args + [output_filename])
 
 
-def ArchForAsmFilename(filename):
-  """Returns the architectures that a given asm file should be compiled for
-  based on substrings in the filename."""
-
-  if 'x86_64' in filename or 'avx2' in filename:
-    return ['x86_64']
-  elif ('x86' in filename and 'x86_64' not in filename) or '586' in filename:
-    return ['x86']
-  elif 'armx' in filename:
-    return ['arm', 'aarch64']
-  elif 'armv8' in filename:
-    return ['aarch64']
-  elif 'arm' in filename:
-    return ['arm']
-  elif 'ppc' in filename:
-    return ['ppc64le']
-  else:
-    raise ValueError('Unknown arch for asm filename: ' + filename)
-
-
 def WriteAsmFiles(perlasms):
   """Generates asm files from perlasm directives for each supported OS x
   platform combination."""
   asmfiles = {}
 
-  for osarch in OS_ARCH_COMBOS:
-    (osname, arch, perlasm_style, extra_args, asm_ext) = osarch
-    key = (osname, arch)
-    outDir = '%s-%s' % key
-
-    for perlasm in perlasms:
-      filename = os.path.basename(perlasm['input'])
+  for perlasm in perlasms:
+    for (osname, arch, perlasm_style, extra_args, asm_ext) in OS_ARCH_COMBOS:
+      if arch != perlasm['arch']:
+        continue
+      # TODO(https://crbug.com/boringssl/524): Now that we incorporate osname in
+      # the output filename, the asm files can just go in a single directory.
+      # For now, we keep them in target-specific directories to avoid breaking
+      # downstream scripts.
+      key = (osname, arch)
+      outDir = '%s-%s' % key
       output = perlasm['output']
       if not output.startswith('src'):
         raise ValueError('output missing src: %s' % output)
       output = os.path.join(outDir, output[4:])
-      if output.endswith('-armx.${ASM_EXT}'):
-        output = output.replace('-armx',
-                                '-armx64' if arch == 'aarch64' else '-armx32')
-      output = output.replace('${ASM_EXT}', asm_ext)
-
-      if arch in ArchForAsmFilename(filename):
-        PerlAsm(output, perlasm['input'], perlasm_style,
-                perlasm['extra_args'] + extra_args)
-        asmfiles.setdefault(key, []).append(output)
+      output = '%s-%s.%s' % (output, osname, asm_ext)
+      PerlAsm(output, perlasm['input'], perlasm_style, extra_args)
+      asmfiles.setdefault(key, []).append(output)
 
   for (key, non_perl_asm_files) in NON_PERL_FILES.items():
     asmfiles.setdefault(key, []).extend(non_perl_asm_files)
@@ -969,8 +909,9 @@ ALL_PLATFORMS = {
 }
 
 if __name__ == '__main__':
-  parser = optparse.OptionParser(usage='Usage: %%prog [--prefix=<path>] [%s]' %
-                                 '|'.join(sorted(ALL_PLATFORMS.keys())))
+  parser = optparse.OptionParser(
+      usage='Usage: %%prog [--prefix=<path>] [all|%s]' %
+      '|'.join(sorted(ALL_PLATFORMS.keys())))
   parser.add_option('--prefix', dest='prefix',
       help='For Bazel, prepend argument to all source files')
   parser.add_option(
@@ -985,12 +926,15 @@ if __name__ == '__main__':
     parser.print_help()
     sys.exit(1)
 
-  platforms = []
-  for s in args:
-    platform = ALL_PLATFORMS.get(s)
-    if platform is None:
-      parser.print_help()
-      sys.exit(1)
-    platforms.append(platform())
+  if 'all' in args:
+    platforms = [platform() for platform in ALL_PLATFORMS.values()]
+  else:
+    platforms = []
+    for s in args:
+      platform = ALL_PLATFORMS.get(s)
+      if platform is None:
+        parser.print_help()
+        sys.exit(1)
+      platforms.append(platform())
 
   sys.exit(main(platforms))

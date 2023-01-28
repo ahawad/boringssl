@@ -64,13 +64,13 @@
 #include <openssl/err.h>
 #include <openssl/mem.h>
 #include <openssl/thread.h>
-#include <openssl/type_check.h>
 
-#include "internal.h"
-#include "../bn/internal.h"
 #include "../../internal.h"
+#include "../bn/internal.h"
 #include "../delocate.h"
 #include "../rand/fork_detect.h"
+#include "../service_indicator/internal.h"
+#include "internal.h"
 
 
 int rsa_check_public_key(const RSA *rsa) {
@@ -261,6 +261,8 @@ size_t rsa_default_size(const RSA *rsa) {
 
 int RSA_encrypt(RSA *rsa, size_t *out_len, uint8_t *out, size_t max_out,
                 const uint8_t *in, size_t in_len, int padding) {
+  boringssl_ensure_rsa_self_test();
+
   if (!rsa_check_public_key(rsa)) {
     return 0;
   }
@@ -363,7 +365,7 @@ err:
 //
 // On success, the index of the assigned BN_BLINDING is written to
 // |*index_used| and must be passed to |rsa_blinding_release| when finished.
-static BN_BLINDING *rsa_blinding_get(RSA *rsa, unsigned *index_used,
+static BN_BLINDING *rsa_blinding_get(RSA *rsa, size_t *index_used,
                                      BN_CTX *ctx) {
   assert(ctx != NULL);
   assert(rsa->mont_n != NULL);
@@ -374,7 +376,7 @@ static BN_BLINDING *rsa_blinding_get(RSA *rsa, unsigned *index_used,
 
   // Wipe the blinding cache on |fork|.
   if (rsa->blinding_fork_generation != fork_generation) {
-    for (unsigned i = 0; i < rsa->num_blindings; i++) {
+    for (size_t i = 0; i < rsa->num_blindings; i++) {
       // The inuse flag must be zero unless we were forked from a
       // multi-threaded process, in which case calling back into BoringSSL is
       // forbidden.
@@ -403,9 +405,9 @@ static BN_BLINDING *rsa_blinding_get(RSA *rsa, unsigned *index_used,
   }
 
   // Double the length of the cache.
-  OPENSSL_STATIC_ASSERT(MAX_BLINDINGS_PER_RSA < UINT_MAX / 2,
-                        "MAX_BLINDINGS_PER_RSA too large");
-  unsigned new_num_blindings = rsa->num_blindings * 2;
+  static_assert(MAX_BLINDINGS_PER_RSA < UINT_MAX / 2,
+                "MAX_BLINDINGS_PER_RSA too large");
+  size_t new_num_blindings = rsa->num_blindings * 2;
   if (new_num_blindings == 0) {
     new_num_blindings = 1;
   }
@@ -414,9 +416,6 @@ static BN_BLINDING *rsa_blinding_get(RSA *rsa, unsigned *index_used,
   }
   assert(new_num_blindings > rsa->num_blindings);
 
-  OPENSSL_STATIC_ASSERT(
-      MAX_BLINDINGS_PER_RSA < UINT_MAX / sizeof(BN_BLINDING *),
-      "MAX_BLINDINGS_PER_RSA too large");
   BN_BLINDING **new_blindings =
       OPENSSL_malloc(sizeof(BN_BLINDING *) * new_num_blindings);
   uint8_t *new_blindings_inuse = OPENSSL_malloc(new_num_blindings);
@@ -428,10 +427,10 @@ static BN_BLINDING *rsa_blinding_get(RSA *rsa, unsigned *index_used,
                  sizeof(BN_BLINDING *) * rsa->num_blindings);
   OPENSSL_memcpy(new_blindings_inuse, rsa->blindings_inuse, rsa->num_blindings);
 
-  for (unsigned i = rsa->num_blindings; i < new_num_blindings; i++) {
+  for (size_t i = rsa->num_blindings; i < new_num_blindings; i++) {
     new_blindings[i] = BN_BLINDING_new();
     if (new_blindings[i] == NULL) {
-      for (unsigned j = rsa->num_blindings; j < i; j++) {
+      for (size_t j = rsa->num_blindings; j < i; j++) {
         BN_BLINDING_free(new_blindings[j]);
       }
       goto err;
@@ -465,7 +464,7 @@ out:
 // rsa_blinding_release marks the cached BN_BLINDING at the given index as free
 // for other threads to use.
 static void rsa_blinding_release(RSA *rsa, BN_BLINDING *blinding,
-                                 unsigned blinding_index) {
+                                 size_t blinding_index) {
   if (blinding_index == MAX_BLINDINGS_PER_RSA) {
     // This blinding wasn't cached.
     BN_BLINDING_free(blinding);
@@ -528,6 +527,8 @@ err:
 
 int rsa_default_decrypt(RSA *rsa, size_t *out_len, uint8_t *out, size_t max_out,
                         const uint8_t *in, size_t in_len, int padding) {
+  boringssl_ensure_rsa_self_test();
+
   const unsigned rsa_size = RSA_size(rsa);
   uint8_t *buf = NULL;
   int ret = 0;
@@ -593,8 +594,9 @@ err:
 
 static int mod_exp(BIGNUM *r0, const BIGNUM *I, RSA *rsa, BN_CTX *ctx);
 
-int RSA_verify_raw(RSA *rsa, size_t *out_len, uint8_t *out, size_t max_out,
-                   const uint8_t *in, size_t in_len, int padding) {
+int rsa_verify_raw_no_self_test(RSA *rsa, size_t *out_len, uint8_t *out,
+                                size_t max_out, const uint8_t *in,
+                                size_t in_len, int padding) {
   if (!rsa_check_public_key(rsa)) {
     return 0;
   }
@@ -686,6 +688,14 @@ err:
   return ret;
 }
 
+int RSA_verify_raw(RSA *rsa, size_t *out_len, uint8_t *out,
+                                size_t max_out, const uint8_t *in,
+                                size_t in_len, int padding) {
+  boringssl_ensure_rsa_self_test();
+  return rsa_verify_raw_no_self_test(rsa, out_len, out, max_out, in, in_len,
+                                     padding);
+}
+
 int rsa_default_private_transform(RSA *rsa, uint8_t *out, const uint8_t *in,
                                   size_t len) {
   if (rsa->n == NULL || rsa->d == NULL) {
@@ -695,7 +705,7 @@ int rsa_default_private_transform(RSA *rsa, uint8_t *out, const uint8_t *in,
 
   BIGNUM *f, *result;
   BN_CTX *ctx = NULL;
-  unsigned blinding_index = 0;
+  size_t blinding_index = 0;
   BN_BLINDING *blinding = NULL;
   int ret = 0;
 
@@ -1262,12 +1272,14 @@ static int rsa_generate_key_impl(RSA *rsa, int bits, const BIGNUM *e_value,
     // values for d.
   } while (BN_cmp(rsa->d, pow2_prime_bits) <= 0);
 
+  assert(BN_num_bits(pm1) == (unsigned)prime_bits);
+  assert(BN_num_bits(qm1) == (unsigned)prime_bits);
   if (// Calculate n.
       !bn_mul_consttime(rsa->n, rsa->p, rsa->q, ctx) ||
       // Calculate d mod (p-1).
-      !bn_div_consttime(NULL, rsa->dmp1, rsa->d, pm1, ctx) ||
+      !bn_div_consttime(NULL, rsa->dmp1, rsa->d, pm1, prime_bits, ctx) ||
       // Calculate d mod (q-1)
-      !bn_div_consttime(NULL, rsa->dmq1, rsa->d, qm1, ctx)) {
+      !bn_div_consttime(NULL, rsa->dmq1, rsa->d, qm1, prime_bits, ctx)) {
     goto bn_err;
   }
   bn_set_minimal_width(rsa->n);
@@ -1322,6 +1334,8 @@ static void replace_bn_mont_ctx(BN_MONT_CTX **out, BN_MONT_CTX **in) {
 static int RSA_generate_key_ex_maybe_fips(RSA *rsa, int bits,
                                           const BIGNUM *e_value, BN_GENCB *cb,
                                           int check_fips) {
+  boringssl_ensure_rsa_self_test();
+
   RSA *tmp = NULL;
   uint32_t err;
   int ret = 0;
@@ -1402,6 +1416,10 @@ int RSA_generate_key_fips(RSA *rsa, int bits, BN_GENCB *cb) {
             BN_set_word(e, RSA_F4) &&
             RSA_generate_key_ex_maybe_fips(rsa, bits, e, cb, /*check_fips=*/1);
   BN_free(e);
+
+  if (ret) {
+    FIPS_service_indicator_update_state();
+  }
   return ret;
 }
 

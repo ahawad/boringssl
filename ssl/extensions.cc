@@ -205,21 +205,36 @@ static bool tls1_check_duplicate_extensions(const CBS *cbs) {
 }
 
 static bool is_post_quantum_group(uint16_t id) {
-  return id == SSL_CURVE_CECPQ2;
+  switch (id) {
+    case SSL_CURVE_CECPQ2:
+    case SSL_CURVE_X25519KYBER768:
+    case SSL_CURVE_P256KYBER768:
+      return true;
+    default:
+      return false;
+  }
 }
 
 bool ssl_client_hello_init(const SSL *ssl, SSL_CLIENT_HELLO *out,
                            Span<const uint8_t> body) {
+  CBS cbs = body;
+  if (!ssl_parse_client_hello_with_trailing_data(ssl, &cbs, out) ||
+      CBS_len(&cbs) != 0) {
+    return false;
+  }
+  return true;
+}
+
+bool ssl_parse_client_hello_with_trailing_data(const SSL *ssl, CBS *cbs,
+                                               SSL_CLIENT_HELLO *out) {
   OPENSSL_memset(out, 0, sizeof(*out));
   out->ssl = const_cast<SSL *>(ssl);
-  out->client_hello = body.data();
-  out->client_hello_len = body.size();
 
-  CBS client_hello, random, session_id;
-  CBS_init(&client_hello, out->client_hello, out->client_hello_len);
-  if (!CBS_get_u16(&client_hello, &out->version) ||
-      !CBS_get_bytes(&client_hello, &random, SSL3_RANDOM_SIZE) ||
-      !CBS_get_u8_length_prefixed(&client_hello, &session_id) ||
+  CBS copy = *cbs;
+  CBS random, session_id;
+  if (!CBS_get_u16(cbs, &out->version) ||
+      !CBS_get_bytes(cbs, &random, SSL3_RANDOM_SIZE) ||
+      !CBS_get_u8_length_prefixed(cbs, &session_id) ||
       CBS_len(&session_id) > SSL_MAX_SSL_SESSION_ID_LENGTH) {
     return false;
   }
@@ -232,16 +247,15 @@ bool ssl_client_hello_init(const SSL *ssl, SSL_CLIENT_HELLO *out,
   // Skip past DTLS cookie
   if (SSL_is_dtls(out->ssl)) {
     CBS cookie;
-    if (!CBS_get_u8_length_prefixed(&client_hello, &cookie) ||
-        CBS_len(&cookie) > DTLS1_COOKIE_LENGTH) {
+    if (!CBS_get_u8_length_prefixed(cbs, &cookie)) {
       return false;
     }
   }
 
   CBS cipher_suites, compression_methods;
-  if (!CBS_get_u16_length_prefixed(&client_hello, &cipher_suites) ||
+  if (!CBS_get_u16_length_prefixed(cbs, &cipher_suites) ||
       CBS_len(&cipher_suites) < 2 || (CBS_len(&cipher_suites) & 1) != 0 ||
-      !CBS_get_u8_length_prefixed(&client_hello, &compression_methods) ||
+      !CBS_get_u8_length_prefixed(cbs, &compression_methods) ||
       CBS_len(&compression_methods) < 1) {
     return false;
   }
@@ -253,23 +267,22 @@ bool ssl_client_hello_init(const SSL *ssl, SSL_CLIENT_HELLO *out,
 
   // If the ClientHello ends here then it's valid, but doesn't have any
   // extensions.
-  if (CBS_len(&client_hello) == 0) {
-    out->extensions = NULL;
+  if (CBS_len(cbs) == 0) {
+    out->extensions = nullptr;
     out->extensions_len = 0;
-    return true;
+  } else {
+    // Extract extensions and check it is valid.
+    CBS extensions;
+    if (!CBS_get_u16_length_prefixed(cbs, &extensions) ||
+        !tls1_check_duplicate_extensions(&extensions)) {
+      return false;
+    }
+    out->extensions = CBS_data(&extensions);
+    out->extensions_len = CBS_len(&extensions);
   }
 
-  // Extract extensions and check it is valid.
-  CBS extensions;
-  if (!CBS_get_u16_length_prefixed(&client_hello, &extensions) ||
-      !tls1_check_duplicate_extensions(&extensions) ||
-      CBS_len(&client_hello) != 0) {
-    return false;
-  }
-
-  out->extensions = CBS_data(&extensions);
-  out->extensions_len = CBS_len(&extensions);
-
+  out->client_hello = CBS_data(&copy);
+  out->client_hello_len = CBS_len(&copy) - CBS_len(cbs);
   return true;
 }
 
@@ -334,8 +347,8 @@ bool tls1_get_shared_group(SSL_HANDSHAKE *hs, uint16_t *out_group_id) {
   for (uint16_t pref_group : pref) {
     for (uint16_t supp_group : supp) {
       if (pref_group == supp_group &&
-          // CECPQ2(b) doesn't fit in the u8-length-prefixed ECPoint field in
-          // TLS 1.2 and below.
+          // Post-quantum key agreements don't fit in the u8-length-prefixed
+          // ECPoint field in TLS 1.2 and below.
           (ssl_protocol_version(ssl) >= TLS1_3_VERSION ||
            !is_post_quantum_group(pref_group))) {
         *out_group_id = pref_group;
@@ -619,20 +632,30 @@ static bool ext_sni_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
 
 // Encrypted ClientHello (ECH)
 //
-// https://tools.ietf.org/html/draft-ietf-tls-esni-10
+// https://tools.ietf.org/html/draft-ietf-tls-esni-13
 
 static bool ext_ech_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
                                     CBB *out_compressible,
                                     ssl_client_hello_type_t type) {
-  if (type == ssl_client_hello_inner || hs->ech_client_bytes.empty()) {
+  if (type == ssl_client_hello_inner) {
+    if (!CBB_add_u16(out, TLSEXT_TYPE_encrypted_client_hello) ||
+        !CBB_add_u16(out, /* length */ 1) ||
+        !CBB_add_u8(out, ECH_CLIENT_INNER)) {
+      return false;
+    }
+    return true;
+  }
+
+  if (hs->ech_client_outer.empty()) {
     return true;
   }
 
   CBB ech_body;
   if (!CBB_add_u16(out, TLSEXT_TYPE_encrypted_client_hello) ||
       !CBB_add_u16_length_prefixed(out, &ech_body) ||
-      !CBB_add_bytes(&ech_body, hs->ech_client_bytes.data(),
-                     hs->ech_client_bytes.size()) ||
+      !CBB_add_u8(&ech_body, ECH_CLIENT_OUTER) ||
+      !CBB_add_bytes(&ech_body, hs->ech_client_outer.data(),
+                     hs->ech_client_outer.size()) ||
       !CBB_flush(out)) {
     return false;
   }
@@ -647,8 +670,10 @@ static bool ext_ech_parse_serverhello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
   }
 
   // The ECH extension may not be sent in TLS 1.2 ServerHello, only TLS 1.3
-  // EncryptedExtension.
-  if (ssl_protocol_version(ssl) < TLS1_3_VERSION) {
+  // EncryptedExtensions. It also may not be sent in response to an inner ECH
+  // extension.
+  if (ssl_protocol_version(ssl) < TLS1_3_VERSION ||
+      ssl->s3->ech_status == ssl_ech_accepted) {
     *out_alert = SSL_AD_UNSUPPORTED_EXTENSION;
     OPENSSL_PUT_ERROR(SSL, SSL_R_UNEXPECTED_EXTENSION);
     return false;
@@ -659,17 +684,7 @@ static bool ext_ech_parse_serverhello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
     return false;
   }
 
-  // The server may only send retry configs in response to ClientHelloOuter (or
-  // ECH GREASE), not ClientHelloInner. The unsolicited extension rule checks
-  // this implicitly because the ClientHelloInner has no encrypted_client_hello
-  // extension.
-  //
-  // TODO(https://crbug.com/boringssl/275): If
-  // https://github.com/tlswg/draft-ietf-tls-esni/pull/422 is merged, a later
-  // draft will fold encrypted_client_hello and ech_is_inner together. Then this
-  // assert should become a runtime check.
-  assert(ssl->s3->ech_status != ssl_ech_accepted);
-  if (hs->selected_ech_config &&
+  if (ssl->s3->ech_status == ssl_ech_rejected &&
       !hs->ech_retry_configs.CopyFrom(*contents)) {
     *out_alert = SSL_AD_INTERNAL_ERROR;
     return false;
@@ -680,10 +695,23 @@ static bool ext_ech_parse_serverhello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
 
 static bool ext_ech_parse_clienthello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
                                       CBS *contents) {
-  if (contents != nullptr) {
-    hs->ech_present = true;
+  if (contents == nullptr) {
     return true;
   }
+
+  uint8_t type;
+  if (!CBS_get_u8(contents, &type)) {
+    return false;
+  }
+  if (type == ECH_CLIENT_OUTER) {
+    // Outer ECH extensions are handled outside the callback.
+    return true;
+  }
+  if (type != ECH_CLIENT_INNER || CBS_len(contents) != 0) {
+    return false;
+  }
+
+  hs->ech_is_inner = true;
   return true;
 }
 
@@ -713,32 +741,6 @@ static bool ext_ech_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
     }
   }
   return CBB_flush(out);
-}
-
-static bool ext_ech_is_inner_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
-                                             CBB *out_compressible,
-                                             ssl_client_hello_type_t type) {
-  if (type == ssl_client_hello_inner) {
-    if (!CBB_add_u16(out, TLSEXT_TYPE_ech_is_inner) ||
-        !CBB_add_u16(out, 0 /* empty extension */)) {
-      return false;
-    }
-  }
-  return true;
-}
-
-static bool ext_ech_is_inner_parse_clienthello(SSL_HANDSHAKE *hs,
-                                               uint8_t *out_alert,
-                                               CBS *contents) {
-  if (contents == nullptr) {
-    return true;
-  }
-  if (CBS_len(contents) > 0) {
-    *out_alert = SSL_AD_ILLEGAL_PARAMETER;
-    return false;
-  }
-  hs->ech_is_inner_present = true;
-  return true;
 }
 
 
@@ -1253,10 +1255,12 @@ static bool ext_npn_parse_serverhello(SSL_HANDSHAKE *hs, uint8_t *out_alert,
     }
   }
 
+  // |orig_len| fits in |unsigned| because TLS extensions use 16-bit lengths.
   uint8_t *selected;
   uint8_t selected_len;
   if (ssl->ctx->next_proto_select_cb(
-          ssl, &selected, &selected_len, orig_contents, orig_len,
+          ssl, &selected, &selected_len, orig_contents,
+          static_cast<unsigned>(orig_len),
           ssl->ctx->next_proto_select_cb_arg) != SSL_TLSEXT_ERR_OK ||
       !ssl->s3->next_proto_negotiated.CopyFrom(
           MakeConstSpan(selected, selected_len))) {
@@ -1569,11 +1573,14 @@ bool ssl_negotiate_alpn(SSL_HANDSHAKE *hs, uint8_t *out_alert,
     return false;
   }
 
+  // |protocol_name_list| fits in |unsigned| because TLS extensions use 16-bit
+  // lengths.
   const uint8_t *selected;
   uint8_t selected_len;
   int ret = ssl->ctx->alpn_select_cb(
       ssl, &selected, &selected_len, CBS_data(&protocol_name_list),
-      CBS_len(&protocol_name_list), ssl->ctx->alpn_select_cb_arg);
+      static_cast<unsigned>(CBS_len(&protocol_name_list)),
+      ssl->ctx->alpn_select_cb_arg);
   // ALPN is required when QUIC is used.
   if (ssl->quic_method &&
       (ret == SSL_TLSEXT_ERR_NOACK || ret == SSL_TLSEXT_ERR_ALERT_WARNING)) {
@@ -1942,13 +1949,10 @@ static bool should_offer_psk(const SSL_HANDSHAKE *hs,
   const SSL *const ssl = hs->ssl;
   if (hs->max_version < TLS1_3_VERSION || ssl->session == nullptr ||
       ssl_session_protocol_version(ssl->session.get()) < TLS1_3_VERSION ||
-      // The ClientHelloOuter cannot include the PSK extension.
-      //
-      // TODO(https://crbug.com/boringssl/275): draft-ietf-tls-esni-10 mandates
-      // this, but it risks breaking the ClientHelloOuter flow on 0-RTT reject.
-      // Later drafts will recommend including a placeholder one, at which point
-      // we will need to synthesize a ticket. See
-      // https://github.com/tlswg/draft-ietf-tls-esni/issues/408
+      // TODO(https://crbug.com/boringssl/275): Should we synthesize a
+      // placeholder PSK, at least when we offer early data? Otherwise
+      // ClientHelloOuter will contain an early_data extension without a
+      // pre_shared_key extension and potentially break the recovery flow.
       type == ssl_client_hello_outer) {
     return false;
   }
@@ -1991,7 +1995,6 @@ static bool ext_pre_shared_key_add_clienthello(const SSL_HANDSHAKE *hs,
 
   // Fill in a placeholder zero binder of the appropriate length. It will be
   // computed and filled in later after length prefixes are computed.
-  uint8_t zero_binder[EVP_MAX_MD_SIZE] = {0};
   size_t binder_len = EVP_MD_size(ssl_session_get_digest(ssl->session.get()));
 
   CBB contents, identity, ticket, binders, binder;
@@ -2004,7 +2007,7 @@ static bool ext_pre_shared_key_add_clienthello(const SSL_HANDSHAKE *hs,
       !CBB_add_u32(&identity, obfuscated_ticket_age) ||
       !CBB_add_u16_length_prefixed(&contents, &binders) ||
       !CBB_add_u8_length_prefixed(&binders, &binder) ||
-      !CBB_add_bytes(&binder, zero_binder, binder_len)) {
+      !CBB_add_zeros(&binder, binder_len)) {
     return false;
   }
 
@@ -2184,10 +2187,7 @@ static bool ext_early_data_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
   // If offering ECH, the extension only applies to ClientHelloInner, but we
   // send the extension in both ClientHellos. This ensures that, if the server
   // handshakes with ClientHelloOuter, it can skip past early data. See
-  // https://github.com/tlswg/draft-ietf-tls-esni/pull/415
-  //
-  // TODO(https://crbug.com/boringssl/275): Replace this with a reference to the
-  // right section in the next draft.
+  // draft-ietf-tls-esni-13, section 6.1.
   if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_early_data) ||
       !CBB_add_u16(out_compressible, 0) ||
       !CBB_flush(out_compressible)) {
@@ -2307,11 +2307,13 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
 
     group_id = groups[0];
 
-    if (is_post_quantum_group(group_id) && groups.size() >= 2) {
-      // CECPQ2(b) is not sent as the only initial key share. We'll include the
-      // 2nd preference group too to avoid round-trips.
-      second_group_id = groups[1];
-      assert(second_group_id != group_id);
+    // We'll try to include one post-quantum and one classical initial key
+    // share.
+    for (size_t i = 1; i < groups.size() && second_group_id == 0; i++) {
+      if (is_post_quantum_group(group_id) != is_post_quantum_group(groups[i])) {
+        second_group_id = groups[i];
+        assert(second_group_id != group_id);
+      }
     }
   }
 
@@ -2592,7 +2594,7 @@ static bool parse_u16_array(const CBS *cbs, Array<uint16_t> *out) {
 
   assert(CBS_len(&copy) == 0);
   *out = std::move(ret);
-  return 1;
+  return true;
 }
 
 static bool ext_supported_groups_parse_clienthello(SSL_HANDSHAKE *hs,
@@ -3111,13 +3113,6 @@ static const struct tls_extension kExtensions[] = {
     ext_ech_add_serverhello,
   },
   {
-    TLSEXT_TYPE_ech_is_inner,
-    ext_ech_is_inner_add_clienthello,
-    forbid_parse_serverhello,
-    ext_ech_is_inner_parse_clienthello,
-    dont_add_serverhello,
-  },
-  {
     TLSEXT_TYPE_extended_master_secret,
     ext_ems_add_clienthello,
     ext_ems_parse_serverhello,
@@ -3324,14 +3319,12 @@ static const struct tls_extension *tls_extension_find(uint32_t *out_index,
 
 static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
   CBB child;
-  uint8_t *ptr;
   if (!CBB_add_u16(cbb, ext) ||  //
       !CBB_add_u16_length_prefixed(cbb, &child) ||
-      !CBB_add_space(&child, &ptr, len)) {
+      !CBB_add_zeros(&child, len)) {
     OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
     return false;
   }
-  OPENSSL_memset(ptr, 0, len);
   return CBB_flush(cbb);
 }
 
@@ -3404,34 +3397,6 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
     }
   }
 
-  // Pad the server name. See draft-ietf-tls-esni-10, section 6.1.2.
-  // TODO(https://crbug.com/boringssl/275): Ideally we'd pad the whole thing to
-  // reduce the output range. See
-  // https://github.com/tlswg/draft-ietf-tls-esni/issues/433
-  size_t padding_len = 0;
-  size_t maximum_name_length = hs->selected_ech_config->maximum_name_length;
-  if (ssl->hostname) {
-    size_t hostname_len = strlen(ssl->hostname.get());
-    if (hostname_len <= maximum_name_length) {
-      padding_len = maximum_name_length - hostname_len;
-    } else {
-      // If the server underestimated the maximum size, pad to a multiple of 32.
-      padding_len = 31 - (hostname_len - 1) % 32;
-      // If the input is close to |maximum_name_length|, pad to the next
-      // multiple for at least 32 bytes of length ambiguity.
-      if (hostname_len + padding_len < maximum_name_length + 32) {
-        padding_len += 32;
-      }
-    }
-  } else {
-    // No SNI. Pad up to |maximum_name_length|, including server_name extension
-    // overhead.
-    padding_len = 9 + maximum_name_length;
-  }
-  if (!add_padding_extension(&extensions, TLSEXT_TYPE_padding, padding_len)) {
-    return false;
-  }
-
   // Uncompressed extensions are encoded as-is.
   if (!CBB_add_bytes(&extensions_encoded, CBB_data(&extensions),
                      CBB_len(&extensions))) {
@@ -3473,8 +3438,8 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
 
 bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
                                 bool *out_needs_psk_binder,
-                                ssl_client_hello_type_t type, size_t header_len,
-                                size_t omit_ech_len) {
+                                ssl_client_hello_type_t type,
+                                size_t header_len) {
   *out_needs_psk_binder = false;
 
   if (type == ssl_client_hello_inner) {
@@ -3507,20 +3472,14 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
     size_t i = hs->extension_permutation.empty()
                    ? unpermuted
                    : hs->extension_permutation[unpermuted];
-    size_t bytes_written;
-    if (omit_ech_len != 0 &&
-        kExtensions[i].value == TLSEXT_TYPE_encrypted_client_hello) {
-      bytes_written = omit_ech_len;
-    } else {
-      const size_t len_before = CBB_len(&extensions);
-      if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
-        OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
-        ERR_add_error_dataf("extension %u", (unsigned)kExtensions[i].value);
-        return false;
-      }
-
-      bytes_written = CBB_len(&extensions) - len_before;
+    const size_t len_before = CBB_len(&extensions);
+    if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
+      OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
+      ERR_add_error_dataf("extension %u", (unsigned)kExtensions[i].value);
+      return false;
     }
+
+    const size_t bytes_written = CBB_len(&extensions) - len_before;
     if (bytes_written != 0) {
       hs->extensions.sent |= (1u << i);
     }
@@ -3544,8 +3503,8 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
   size_t psk_extension_len = ext_pre_shared_key_clienthello_length(hs, type);
   if (!SSL_is_dtls(ssl) && !ssl->quic_method &&
       !ssl->s3->used_hello_retry_request) {
-    header_len += SSL3_HM_HEADER_LENGTH + 2 + CBB_len(&extensions) +
-                  omit_ech_len + psk_extension_len;
+    header_len +=
+        SSL3_HM_HEADER_LENGTH + 2 + CBB_len(&extensions) + psk_extension_len;
     size_t padding_len = 0;
 
     // The final extension must be non-empty. WebSphere Application
@@ -3719,18 +3678,10 @@ bool ssl_parse_clienthello_tlsext(SSL_HANDSHAKE *hs,
   return true;
 }
 
-static bool ssl_scan_serverhello_tlsext(SSL_HANDSHAKE *hs, CBS *cbs,
+static bool ssl_scan_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *cbs,
                                         int *out_alert) {
-  SSL *const ssl = hs->ssl;
-  // Before TLS 1.3, ServerHello extensions blocks may be omitted if empty.
-  if (CBS_len(cbs) == 0 && ssl_protocol_version(ssl) < TLS1_3_VERSION) {
-    return true;
-  }
-
-  // Decode the extensions block and check it is valid.
-  CBS extensions;
-  if (!CBS_get_u16_length_prefixed(cbs, &extensions) ||
-      !tls1_check_duplicate_extensions(&extensions)) {
+  CBS extensions = *cbs;
+  if (!tls1_check_duplicate_extensions(&extensions)) {
     *out_alert = SSL_AD_DECODE_ERROR;
     return false;
   }
@@ -3852,7 +3803,7 @@ static bool ssl_check_serverhello_tlsext(SSL_HANDSHAKE *hs) {
   return true;
 }
 
-bool ssl_parse_serverhello_tlsext(SSL_HANDSHAKE *hs, CBS *cbs) {
+bool ssl_parse_serverhello_tlsext(SSL_HANDSHAKE *hs, const CBS *cbs) {
   SSL *const ssl = hs->ssl;
   int alert = SSL_AD_DECODE_ERROR;
   if (!ssl_scan_serverhello_tlsext(hs, cbs, &alert)) {
@@ -3880,8 +3831,8 @@ static enum ssl_ticket_aead_result_t decrypt_ticket_with_cipher_ctx(
     return ssl_ticket_aead_ignore_ticket;
   }
   // Split the ticket into the ticket and the MAC.
-  auto ticket_mac = ticket.subspan(ticket.size() - mac_len);
-  ticket = ticket.subspan(0, ticket.size() - mac_len);
+  auto ticket_mac = ticket.last(mac_len);
+  ticket = ticket.first(ticket.size() - mac_len);
   HMAC_Update(hmac_ctx, ticket.data(), ticket.size());
   HMAC_Final(hmac_ctx, mac, NULL);
   assert(mac_len == ticket_mac.size());
@@ -4038,6 +3989,16 @@ enum ssl_ticket_aead_result_t ssl_process_ticket(
                                                       : ssl_ticket_aead_error;
   } else if (is_psk && hints && !hs->hints_requested && hints->ignore_psk) {
     result = ssl_ticket_aead_ignore_ticket;
+  } else if (!is_psk && hints && !hs->hints_requested &&
+             !hints->decrypted_ticket.empty()) {
+    if (plaintext.CopyFrom(hints->decrypted_ticket)) {
+      result = ssl_ticket_aead_success;
+      *out_renew_ticket = hints->renew_ticket;
+    } else {
+      result = ssl_ticket_aead_error;
+    }
+  } else if (!is_psk && hints && !hs->hints_requested && hints->ignore_ticket) {
+    result = ssl_ticket_aead_ignore_ticket;
   } else if (ssl->session_ctx->ticket_aead_method != NULL) {
     result = ssl_decrypt_ticket_with_method(hs, &plaintext, out_renew_ticket,
                                             ticket);
@@ -4056,12 +4017,24 @@ enum ssl_ticket_aead_result_t ssl_process_ticket(
     }
   }
 
-  if (is_psk && hints && hs->hints_requested) {
+  if (hints && hs->hints_requested) {
     if (result == ssl_ticket_aead_ignore_ticket) {
-      hints->ignore_psk = true;
-    } else if (result == ssl_ticket_aead_success &&
-               !hints->decrypted_psk.CopyFrom(plaintext)) {
-      return ssl_ticket_aead_error;
+      if (is_psk) {
+        hints->ignore_psk = true;
+      } else {
+        hints->ignore_ticket = true;
+      }
+    } else if (result == ssl_ticket_aead_success) {
+      if (is_psk) {
+        if (!hints->decrypted_psk.CopyFrom(plaintext)) {
+          return ssl_ticket_aead_error;
+        }
+      } else {
+        if (!hints->decrypted_ticket.CopyFrom(plaintext)) {
+          return ssl_ticket_aead_error;
+        }
+        hints->renew_ticket = *out_renew_ticket;
+      }
     }
   }
 
@@ -4138,10 +4111,7 @@ bool tls1_choose_signature_algorithm(SSL_HANDSHAKE *hs, uint16_t *out) {
   Span<const uint16_t> peer_sigalgs = tls1_get_peer_verify_algorithms(hs);
 
   for (uint16_t sigalg : sigalgs) {
-    // SSL_SIGN_RSA_PKCS1_MD5_SHA1 is an internal value and should never be
-    // negotiated.
-    if (sigalg == SSL_SIGN_RSA_PKCS1_MD5_SHA1 ||
-        !ssl_private_key_supports_signature_algorithm(hs, sigalg)) {
+    if (!ssl_private_key_supports_signature_algorithm(hs, sigalg)) {
       continue;
     }
 

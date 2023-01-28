@@ -487,10 +487,7 @@ ssl_open_record_t dtls1_open_change_cipher_spec(SSL *ssl, size_t *out_consumed,
 
 // Sending handshake messages.
 
-void DTLS_OUTGOING_MESSAGE::Clear() {
-  OPENSSL_free(data);
-  data = nullptr;
-}
+void DTLS_OUTGOING_MESSAGE::Clear() { data.Reset(); }
 
 void dtls_clear_outgoing_messages(SSL *ssl) {
   for (size_t i = 0; i < ssl->d1->outgoing_messages_len; i++) {
@@ -578,9 +575,7 @@ static bool add_outgoing(SSL *ssl, bool is_ccs, Array<uint8_t> data) {
 
   DTLS_OUTGOING_MESSAGE *msg =
       &ssl->d1->outgoing_messages[ssl->d1->outgoing_messages_len];
-  size_t len;
-  data.Release(&msg->data, &len);
-  msg->len = len;
+  msg->data = std::move(data);
   msg->epoch = ssl->d1->w_epoch;
   msg->is_ccs = is_ccs;
 
@@ -665,7 +660,7 @@ static enum seal_result_t seal_next_message(SSL *ssl, uint8_t *out,
   // DTLS messages are serialized as a single fragment in |msg|.
   CBS cbs, body;
   struct hm_header_st hdr;
-  CBS_init(&cbs, msg->data, msg->len);
+  CBS_init(&cbs, msg->data.data(), msg->data.size());
   if (!dtls1_parse_fragment(&cbs, &hdr, &body) ||
       hdr.frag_off != 0 ||
       hdr.frag_len != CBS_len(&body) ||
@@ -687,6 +682,7 @@ static enum seal_result_t seal_next_message(SSL *ssl, uint8_t *out,
 
   // Assemble a fragment, to be sealed in-place.
   ScopedCBB cbb;
+  CBB child;
   uint8_t *frag = out + prefix;
   size_t max_frag = max_out - prefix, frag_len;
   if (!CBB_init_fixed(cbb.get(), frag, max_frag) ||
@@ -694,8 +690,8 @@ static enum seal_result_t seal_next_message(SSL *ssl, uint8_t *out,
       !CBB_add_u24(cbb.get(), hdr.msg_len) ||
       !CBB_add_u16(cbb.get(), hdr.seq) ||
       !CBB_add_u24(cbb.get(), ssl->d1->outgoing_offset) ||
-      !CBB_add_u24(cbb.get(), todo) ||
-      !CBB_add_bytes(cbb.get(), CBS_data(&body), todo) ||
+      !CBB_add_u24_length_prefixed(cbb.get(), &child) ||
+      !CBB_add_bytes(&child, CBS_data(&body), todo) ||
       !CBB_finish(cbb.get(), NULL, &frag_len)) {
     OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
     return seal_error;
@@ -778,11 +774,9 @@ static int send_flight(SSL *ssl) {
 
   dtls1_update_mtu(ssl);
 
-  int ret = -1;
-  uint8_t *packet = (uint8_t *)OPENSSL_malloc(ssl->d1->mtu);
-  if (packet == NULL) {
-    OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);
-    goto err;
+  Array<uint8_t> packet;
+  if (!packet.Init(ssl->d1->mtu)) {
+    return -1;
   }
 
   while (ssl->d1->outgoing_written < ssl->d1->outgoing_messages_len) {
@@ -790,31 +784,26 @@ static int send_flight(SSL *ssl) {
     uint32_t old_offset = ssl->d1->outgoing_offset;
 
     size_t packet_len;
-    if (!seal_next_packet(ssl, packet, &packet_len, ssl->d1->mtu)) {
-      goto err;
+    if (!seal_next_packet(ssl, packet.data(), &packet_len, packet.size())) {
+      return -1;
     }
 
-    int bio_ret = BIO_write(ssl->wbio.get(), packet, packet_len);
+    int bio_ret = BIO_write(ssl->wbio.get(), packet.data(), packet_len);
     if (bio_ret <= 0) {
       // Retry this packet the next time around.
       ssl->d1->outgoing_written = old_written;
       ssl->d1->outgoing_offset = old_offset;
       ssl->s3->rwstate = SSL_ERROR_WANT_WRITE;
-      ret = bio_ret;
-      goto err;
+      return bio_ret;
     }
   }
 
   if (BIO_flush(ssl->wbio.get()) <= 0) {
     ssl->s3->rwstate = SSL_ERROR_WANT_WRITE;
-    goto err;
+    return -1;
   }
 
-  ret = 1;
-
-err:
-  OPENSSL_free(packet);
-  return ret;
+  return 1;
 }
 
 int dtls1_flush_flight(SSL *ssl) {

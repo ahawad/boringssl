@@ -62,6 +62,7 @@
 
 #include "../../internal.h"
 #include "../digest/md32_common.h"
+#include "../service_indicator/internal.h"
 #include "internal.h"
 
 
@@ -132,7 +133,7 @@ int SHA224_Update(SHA256_CTX *ctx, const void *data, size_t len) {
   return SHA256_Update(ctx, data, len);
 }
 
-static int sha256_final_impl(uint8_t *out, SHA256_CTX *c) {
+static int sha256_final_impl(uint8_t *out, size_t md_len, SHA256_CTX *c) {
   crypto_md32_final(&sha256_block_data_order, c->h, c->data, SHA256_CBLOCK,
                     &c->num, c->Nh, c->Nl, /*is_big_endian=*/1);
 
@@ -140,16 +141,18 @@ static int sha256_final_impl(uint8_t *out, SHA256_CTX *c) {
   // 'final' function can fail. SHA-512 does not have a corresponding check.
   // These functions already misbehave if the caller arbitrarily mutates |c|, so
   // can we assume one of |SHA256_Init| or |SHA224_Init| was used?
-  if (c->md_len > SHA256_DIGEST_LENGTH) {
+  if (md_len > SHA256_DIGEST_LENGTH) {
     return 0;
   }
 
-  assert(c->md_len % 4 == 0);
-  const size_t out_words = c->md_len / 4;
+  assert(md_len % 4 == 0);
+  const size_t out_words = md_len / 4;
   for (size_t i = 0; i < out_words; i++) {
     CRYPTO_store_u32_be(out, c->h[i]);
     out += 4;
   }
+
+  FIPS_service_indicator_update_state();
   return 1;
 }
 
@@ -159,13 +162,14 @@ int SHA256_Final(uint8_t out[SHA256_DIGEST_LENGTH], SHA256_CTX *c) {
   // |SHA256_Final| and expects |sha->md_len| to carry the size over.
   //
   // TODO(davidben): Add an assert and fix code to match them up.
-  return sha256_final_impl(out, c);
+  return sha256_final_impl(out, c->md_len, c);
 }
+
 int SHA224_Final(uint8_t out[SHA224_DIGEST_LENGTH], SHA256_CTX *ctx) {
-  // SHA224_Init sets |ctx->md_len| to |SHA224_DIGEST_LENGTH|, so this has a
-  // smaller output.
+  // This function must be paired with |SHA224_Init|, which sets |ctx->md_len|
+  // to |SHA224_DIGEST_LENGTH|.
   assert(ctx->md_len == SHA224_DIGEST_LENGTH);
-  return sha256_final_impl(out, ctx);
+  return sha256_final_impl(out, SHA224_DIGEST_LENGTH, ctx);
 }
 
 #ifndef SHA256_ASM
@@ -184,15 +188,17 @@ static const uint32_t K256[64] = {
     0x682e6ff3UL, 0x748f82eeUL, 0x78a5636fUL, 0x84c87814UL, 0x8cc70208UL,
     0x90befffaUL, 0xa4506cebUL, 0xbef9a3f7UL, 0xc67178f2UL};
 
-#define ROTATE(a, n) (((a) << (n)) | ((a) >> (32 - (n))))
-
-// FIPS specification refers to right rotations, while our ROTATE macro
-// is left one. This is why you might notice that rotation coefficients
-// differ from those observed in FIPS document by 32-N...
-#define Sigma0(x) (ROTATE((x), 30) ^ ROTATE((x), 19) ^ ROTATE((x), 10))
-#define Sigma1(x) (ROTATE((x), 26) ^ ROTATE((x), 21) ^ ROTATE((x), 7))
-#define sigma0(x) (ROTATE((x), 25) ^ ROTATE((x), 14) ^ ((x) >> 3))
-#define sigma1(x) (ROTATE((x), 15) ^ ROTATE((x), 13) ^ ((x) >> 10))
+// See FIPS 180-4, section 4.1.2.
+#define Sigma0(x)                                       \
+  (CRYPTO_rotr_u32((x), 2) ^ CRYPTO_rotr_u32((x), 13) ^ \
+   CRYPTO_rotr_u32((x), 22))
+#define Sigma1(x)                                       \
+  (CRYPTO_rotr_u32((x), 6) ^ CRYPTO_rotr_u32((x), 11) ^ \
+   CRYPTO_rotr_u32((x), 25))
+#define sigma0(x) \
+  (CRYPTO_rotr_u32((x), 7) ^ CRYPTO_rotr_u32((x), 18) ^ ((x) >> 3))
+#define sigma1(x) \
+  (CRYPTO_rotr_u32((x), 17) ^ CRYPTO_rotr_u32((x), 19) ^ ((x) >> 10))
 
 #define Ch(x, y, z) (((x) & (y)) ^ ((~(x)) & (z)))
 #define Maj(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
@@ -309,7 +315,6 @@ void SHA256_TransformBlocks(uint32_t state[8], const uint8_t *data,
   sha256_block_data_order(state, data, num_blocks);
 }
 
-#undef ROTATE
 #undef Sigma0
 #undef Sigma1
 #undef sigma0

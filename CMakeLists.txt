@@ -1,7 +1,13 @@
-cmake_minimum_required(VERSION 3.5)
+cmake_minimum_required(VERSION 3.10)
 
 # Defer enabling C and CXX languages.
 project(BoringSSL NONE)
+
+# Don't install BoringSSL to system directories by default; it has no stable
+# ABI. Instead, default to an "install" directory under the source.
+if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
+  set(CMAKE_INSTALL_PREFIX ${CMAKE_SOURCE_DIR}/install CACHE PATH "" FORCE)
+endif()
 
 if(WIN32)
   # On Windows, prefer cl over gcc if both are available. By default most of
@@ -10,9 +16,12 @@ if(WIN32)
 endif()
 
 include(sources.cmake)
+include(cmake/perlasm.cmake)
 
 enable_language(C)
 enable_language(CXX)
+
+include(GNUInstallDirs)
 
 # This is a dummy target which all other targets depend on (manually - see other
 # CMakeLists.txt files). This gives us a hook to add any targets which need to
@@ -114,10 +123,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
   set(EMSCRIPTEN 1)
 endif()
 
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+
 if(CMAKE_COMPILER_IS_GNUCXX OR CLANG)
   # Note clang-cl is odd and sets both CLANG and MSVC. We base our configuration
   # primarily on our normal Clang one.
-  set(C_CXX_FLAGS "-Werror -Wformat=2 -Wsign-compare -Wmissing-field-initializers -Wwrite-strings -Wvla")
+  set(C_CXX_FLAGS "-Werror -Wformat=2 -Wsign-compare -Wmissing-field-initializers -Wwrite-strings -Wvla -Wshadow -Wtype-limits")
   if(MSVC)
     # clang-cl sets different default warnings than clang. It also treats -Wall
     # as -Weverything, to match MSVC. Instead -W3 is the alias for -Wall.
@@ -145,21 +159,29 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CLANG)
     set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wno-free-nonheap-object")
   endif()
 
-  if(CLANG OR NOT "7.0.0" VERSION_GREATER CMAKE_C_COMPILER_VERSION)
+  # -Wstring-concatenation was added in Clang 12.0.0, which corresponds to
+  # AppleClang 13.0.0 per the table in
+  # https://en.wikipedia.org/wiki/Xcode#Toolchain_versions
+  if((CMAKE_C_COMPILER_ID STREQUAL "Clang" AND
+      CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "12.0.0") OR
+     (CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND
+      CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "13.0.0"))
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wstring-concatenation")
+  endif()
+
+  if(CLANG OR CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "7.0.0")
     set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wimplicit-fallthrough")
+  endif()
+
+  if(CMAKE_COMPILER_IS_GNUCXX)
+    set(C_CXX_FLAGS "${C_CXX_FLAGS} -Wformat-signedness")
   endif()
 
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${C_CXX_FLAGS} -Wmissing-prototypes -Wold-style-definition -Wstrict-prototypes")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${C_CXX_FLAGS} -Wmissing-declarations")
 
-  if(NOT MSVC)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
-    if(APPLE)
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
-    endif()
-    if(NOT BORINGSSL_ALLOW_CXX_RUNTIME)
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti")
-    endif()
+  if(NOT MSVC AND NOT BORINGSSL_ALLOW_CXX_RUNTIME)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions -fno-rtti")
   endif()
 
   # In GCC, -Wmissing-declarations is the C++ spelling of -Wmissing-prototypes
@@ -172,74 +194,24 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CLANG)
   if(CLANG)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wmissing-prototypes")
   endif()
-
-  if(CMAKE_COMPILER_IS_GNUCXX AND "4.8" VERSION_GREATER CMAKE_C_COMPILER_VERSION)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-array-bounds")
-  endif()
-
 elseif(MSVC)
   set(MSVC_DISABLED_WARNINGS_LIST
-      "C4061" # enumerator 'identifier' in switch of enum 'enumeration' is not
-              # explicitly handled by a case label
-              # Disable this because it flags even when there is a default.
       "C4100" # 'exarg' : unreferenced formal parameter
       "C4127" # conditional expression is constant
-      "C4200" # nonstandard extension used : zero-sized array in
-              # struct/union.
+      # C4204 and C4221 are C89-only restrictions which were dropped in C99, but
+      # VS2017 warns about it. They can be removed when we require VS2019.
       "C4204" # nonstandard extension used: non-constant aggregate initializer
       "C4221" # nonstandard extension used : 'identifier' : cannot be
               # initialized using address of automatic variable
-      "C4242" # 'function' : conversion from 'int' to 'uint8_t',
-              # possible loss of data
       "C4244" # 'function' : conversion from 'int' to 'uint8_t',
               # possible loss of data
       "C4267" # conversion from 'size_t' to 'int', possible loss of data
-      "C4371" # layout of class may have changed from a previous version of the
-              # compiler due to better packing of member '...'
-      "C4388" # signed/unsigned mismatch
-      "C4296" # '>=' : expression is always true
-      "C4350" # behavior change: 'std::_Wrap_alloc...'
-      "C4365" # '=' : conversion from 'size_t' to 'int',
-              # signed/unsigned mismatch
-      "C4389" # '!=' : signed/unsigned mismatch
-      "C4464" # relative include path contains '..'
-      "C4510" # 'argument' : default constructor could not be generated
-      "C4512" # 'argument' : assignment operator could not be generated
-      "C4514" # 'function': unreferenced inline function has been removed
-      "C4548" # expression before comma has no effect; expected expression with
-              # side-effect" caused by FD_* macros.
-      "C4610" # struct 'argument' can never be instantiated - user defined
-              # constructor required.
-      "C4623" # default constructor was implicitly defined as deleted
-      "C4625" # copy constructor could not be generated because a base class
-              # copy constructor is inaccessible or deleted
-      "C4626" # assignment operator could not be generated because a base class
-              # assignment operator is inaccessible or deleted
-      "C4628" # digraphs not supported with -Ze
-      "C4668" # 'symbol' is not defined as a preprocessor macro, replacing with
-              # '0' for 'directives'
-              # Disable this because GTest uses it everywhere.
       "C4706" # assignment within conditional expression
-      "C4710" # 'function': function not inlined
-      "C4711" # function 'function' selected for inline expansion
-      "C4800" # 'int' : forcing value to bool 'true' or 'false'
-              # (performance warning)
-      "C4820" # 'bytes' bytes padding added after construct 'member_name'
-      "C5026" # move constructor was implicitly defined as deleted
-      "C5027" # move assignment operator was implicitly defined as deleted
-      "C5045" # Compiler will insert Spectre mitigation for memory load if
-              # /Qspectre switch specified
-      )
-  set(MSVC_LEVEL4_WARNINGS_LIST
-      # See https://connect.microsoft.com/VisualStudio/feedback/details/1217660/warning-c4265-when-using-functional-header
-      "C4265" # class has virtual functions, but destructor is not virtual
       )
   string(REPLACE "C" " -wd" MSVC_DISABLED_WARNINGS_STR
                             ${MSVC_DISABLED_WARNINGS_LIST})
-  string(REPLACE "C" " -w4" MSVC_LEVEL4_WARNINGS_STR
-                            ${MSVC_LEVEL4_WARNINGS_LIST})
-  set(CMAKE_C_FLAGS   "-utf-8 -Wall -WX ${MSVC_DISABLED_WARNINGS_STR} ${MSVC_LEVEL4_WARNINGS_STR}")
-  set(CMAKE_CXX_FLAGS "-utf-8 -Wall -WX ${MSVC_DISABLED_WARNINGS_STR} ${MSVC_LEVEL4_WARNINGS_STR}")
+  set(CMAKE_C_FLAGS   "-utf-8 -W4 -WX ${MSVC_DISABLED_WARNINGS_STR}")
+  set(CMAKE_CXX_FLAGS "-utf-8 -W4 -WX ${MSVC_DISABLED_WARNINGS_STR}")
 endif()
 
 if(WIN32)
@@ -248,24 +220,13 @@ if(WIN32)
   add_definitions(-DNOMINMAX)
   # Allow use of fopen.
   add_definitions(-D_CRT_SECURE_NO_WARNINGS)
-  # VS 2017 and higher supports STL-only warning suppressions.
-  # A bug in CMake < 3.13.0 may cause the space in this value to
-  # cause issues when building with NASM. In that case, update CMake.
-  add_definitions("-D_STL_EXTRA_DISABLED_WARNINGS=4774 4987")
 endif()
 
-if((CMAKE_COMPILER_IS_GNUCXX AND CMAKE_C_COMPILER_VERSION VERSION_GREATER "4.7.99") OR
-   CLANG)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wshadow")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wshadow")
-endif()
-
-if(CMAKE_COMPILER_IS_GNUCXX)
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=c11")
-endif()
-
-# pthread_rwlock_t requires a feature flag.
-if(NOT WIN32)
+# pthread_rwlock_t on Linux requires a feature flag. We limit this to Linux
+# because, on Apple platforms, it instead disables APIs we use. See compat(5)
+# and sys/cdefs.h. Reportedly, FreeBSD also breaks when this is set. See
+# https://crbug.com/boringssl/471.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_XOPEN_SOURCE=700")
 endif()
 
@@ -405,11 +366,13 @@ endif()
 
 function(go_executable dest package)
   set(godeps "${CMAKE_SOURCE_DIR}/util/godeps.go")
-  if(${CMAKE_VERSION} VERSION_LESS "3.7" OR
-     NOT ${CMAKE_GENERATOR} STREQUAL "Ninja")
-    # The DEPFILE parameter to add_custom_command is new as of CMake 3.7 and
-    # only works with Ninja. Query the sources at configure time. Additionally,
-    # everything depends on go.mod. That affects what external packages to use.
+  if(NOT CMAKE_GENERATOR STREQUAL "Ninja")
+    # The DEPFILE parameter to add_custom_command only works with Ninja. Query
+    # the sources at configure time. Additionally, everything depends on go.mod.
+    # That affects what external packages to use.
+    #
+    # TODO(davidben): Starting CMake 3.20, it also works with Make. Starting
+    # 3.21, it works with Visual Studio and Xcode too.
     execute_process(COMMAND ${GO_EXECUTABLE} run ${godeps} -format cmake
                             -pkg ${package}
                     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -440,69 +403,40 @@ function(go_executable dest package)
   endif()
 endfunction()
 
-# CMake's iOS support uses Apple's multiple-architecture toolchain. It takes an
-# architecture list from CMAKE_OSX_ARCHITECTURES, leaves CMAKE_SYSTEM_PROCESSOR
-# alone, and expects all architecture-specific logic to be conditioned within
-# the source files rather than the build. This does not work for our assembly
-# files, so we fix CMAKE_SYSTEM_PROCESSOR and only support single-architecture
-# builds.
-if(NOT OPENSSL_NO_ASM AND CMAKE_OSX_ARCHITECTURES)
-  list(LENGTH CMAKE_OSX_ARCHITECTURES NUM_ARCHES)
-  if(NOT ${NUM_ARCHES} EQUAL 1)
-    message(FATAL_ERROR "Universal binaries not supported.")
+if(OPENSSL_NO_ASM)
+  add_definitions(-DOPENSSL_NO_ASM)
+endif()
+
+if(FIPS_DELOCATE OR NOT OPENSSL_NO_ASM)
+  # On x86 and x86_64 Windows, we use the NASM output.
+  if(WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64|x86|i[3-6]86")
+    enable_language(ASM_NASM)
+    set(OPENSSL_NASM TRUE)
+    set(CMAKE_ASM_NASM_FLAGS "${CMAKE_ASM_NASM_FLAGS} -gcv8")
+  else()
+    enable_language(ASM)
+    set(OPENSSL_ASM TRUE)
+    # CMake does not add -isysroot and -arch flags to assembly.
+    if(APPLE)
+      if(CMAKE_OSX_SYSROOT)
+        set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -isysroot \"${CMAKE_OSX_SYSROOT}\"")
+      endif()
+      foreach(arch ${CMAKE_OSX_ARCHITECTURES})
+        set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -arch ${arch}")
+      endforeach()
+    endif()
+    if(NOT WIN32)
+      set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -Wa,--noexecstack")
+    endif()
+    # Clang's integerated assembler does not support debug symbols.
+    if(NOT CMAKE_ASM_COMPILER_ID MATCHES "Clang")
+      set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -Wa,-g")
+    endif()
   endif()
-  list(GET CMAKE_OSX_ARCHITECTURES 0 CMAKE_SYSTEM_PROCESSOR)
 endif()
 
 if(OPENSSL_NO_SSE2_FOR_TESTING)
   add_definitions(-DOPENSSL_NO_SSE2_FOR_TESTING)
-endif()
-
-if(OPENSSL_NO_ASM)
-  add_definitions(-DOPENSSL_NO_ASM)
-  set(ARCH "generic")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86_64")
-  set(ARCH "x86_64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "amd64")
-  set(ARCH "x86_64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "AMD64")
-  # cmake reports AMD64 on Windows, but we might be building for 32-bit.
-  if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    set(ARCH "x86_64")
-  else()
-    set(ARCH "x86")
-  endif()
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "x86")
-  set(ARCH "x86")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i386")
-  set(ARCH "x86")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "i686")
-  set(ARCH "x86")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "aarch64")
-  set(ARCH "aarch64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "ARM64")
-  set(ARCH "aarch64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64")
-  set(ARCH "aarch64")
-# Apple A12 Bionic chipset which is added in iPhone XS/XS Max/XR uses arm64e architecture.
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "arm64e")
-  set(ARCH "aarch64")
-elseif(${CMAKE_SYSTEM_PROCESSOR} MATCHES "^arm*")
-  set(ARCH "arm")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "mips")
-  # Just to avoid the “unknown processor” error.
-  set(ARCH "generic")
-elseif(${CMAKE_SYSTEM_PROCESSOR} STREQUAL "ppc64le")
-  set(ARCH "ppc64le")
-else()
-  message(FATAL_ERROR "Unknown processor:" ${CMAKE_SYSTEM_PROCESSOR})
-endif()
-
-if(ANDROID AND NOT ANDROID_NDK_REVISION AND ${ARCH} STREQUAL "arm")
-  # The third-party Android-NDK CMake files somehow fail to set the -march flag
-  # for assembly files. Without this flag, the compiler believes that it's
-  # building for ARMv5.
-  set(CMAKE_ASM_FLAGS "-march=${CMAKE_SYSTEM_PROCESSOR} ${CMAKE_ASM_FLAGS}")
 endif()
 
 if(USE_CUSTOM_LIBCXX)
@@ -517,6 +451,7 @@ if(USE_CUSTOM_LIBCXX)
   set(CMAKE_CXX_LINK_FLAGS "${CMAKE_CXX_LINK_FLAGS} -nostdlib++")
   include_directories(
     SYSTEM
+    util/bot/libcxx-config
     util/bot/libcxx/include
     util/bot/libcxxabi/include
   )
@@ -542,7 +477,7 @@ if(USE_CUSTOM_LIBCXX)
     libcxxabi PRIVATE
     -D_LIBCPP_ENABLE_CXX17_REMOVED_UNEXPECTED_FUNCTIONS
   )
-  set_target_properties(libcxxabi PROPERTIES COMPILE_FLAGS "-Wno-missing-prototypes -Wno-implicit-fallthrough")
+  install(TARGETS libcxxabi EXPORT OpenSSLTargets)
 
   add_library(libcxx ${LIBCXX_SOURCES})
   if(ASAN OR MSAN OR TSAN)
@@ -557,7 +492,17 @@ if(USE_CUSTOM_LIBCXX)
     -D_LIBCPP_BUILDING_LIBRARY
     -DLIBCXX_BUILDING_LIBCXXABI
   )
+  set_target_properties(
+    libcxx libcxxabi PROPERTIES
+    COMPILE_FLAGS "-Wno-missing-prototypes -Wno-implicit-fallthrough"
+    # libc++ and libc++abi must be built in C++20 mode.
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED TRUE
+  )
+  # libc++abi depends on libc++ internal headers.
+  set_property(TARGET libcxx libcxxabi APPEND PROPERTY INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/util/bot/libcxx/src")
   target_link_libraries(libcxx libcxxabi)
+  install(TARGETS libcxx EXPORT OpenSSLTargets DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
 # Add minimal googletest targets. The provided one has many side-effects, and
@@ -595,7 +540,7 @@ add_subdirectory(crypto)
 add_subdirectory(ssl)
 add_subdirectory(ssl/test)
 add_subdirectory(tool)
-add_subdirectory(util/fipstools/cavp)
+add_subdirectory(util/fipstools)
 add_subdirectory(util/fipstools/acvp/modulewrapper)
 add_subdirectory(decrepit)
 
@@ -611,7 +556,16 @@ if(FUZZ)
   add_subdirectory(fuzz)
 endif()
 
-if(UNIX AND NOT APPLE AND NOT ANDROID)
+if(RUST_BINDINGS)
+  find_program(BINDGEN_EXECUTABLE bindgen)
+  if(NOT BINDGEN_EXECUTABLE)
+    message(FATAL_ERROR "Could not find bindgen but was asked to generate Rust bindings.")
+  else()
+    add_subdirectory(rust)
+  endif()
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(HANDSHAKER_ARGS "-handshaker-path" $<TARGET_FILE:handshaker>)
 endif()
 
@@ -649,3 +603,12 @@ add_custom_target(
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     DEPENDS all_tests bssl_shim handshaker fips_specific_tests_if_any
     USES_TERMINAL)
+
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(EXPORT OpenSSLTargets
+  FILE OpenSSLTargets.cmake
+  NAMESPACE OpenSSL::
+  DESTINATION lib/cmake/OpenSSL
+)
+install(FILES OpenSSLConfig.cmake DESTINATION lib/cmake/OpenSSL)
