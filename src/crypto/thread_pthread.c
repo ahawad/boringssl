@@ -48,7 +48,7 @@ union ticketlock {
   struct {
     unsigned short ticket;
     unsigned short users;
-  }
+  } s;
 };
 
 typedef struct {
@@ -69,10 +69,10 @@ static void ticket_unlock(ticketlock *t) {
   t->s.ticket++;
 }
 
-OPENSSL_STATIC_ASSERT(sizeof(CRYPTO_MUTEX) >= sizeof(ticketlock),
+static_assert(sizeof(CRYPTO_MUTEX) >= sizeof(ticketlock),
                       "CRYPTO_MUTEX is too small");
 #if defined(__GNUC__) || defined(__clang__)
-OPENSSL_STATIC_ASSERT(alignof(CRYPTO_MUTEX) >= alignof(ticketlock),
+static_assert(alignof(CRYPTO_MUTEX) >= alignof(ticketlock),
                       "CRYPTO_MUTEX has insufficient alignment");
 #endif
 
