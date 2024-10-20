@@ -483,14 +483,20 @@ static inline int constant_time_select_int(crypto_word_t mask, int a, int b) {
 // Thread-safe initialisation.
 
 #if !defined(OPENSSL_THREADS)
+#warning "HERE"
 typedef uint32_t CRYPTO_once_t;
 #define CRYPTO_ONCE_INIT 0
 #elif defined(OPENSSL_WINDOWS_THREADS)
+#warning "HERE"
 typedef INIT_ONCE CRYPTO_once_t;
 #define CRYPTO_ONCE_INIT INIT_ONCE_STATIC_INIT
 #elif defined(OPENSSL_PTHREADS)
-typedef pthread_once_t CRYPTO_once_t;
-#define CRYPTO_ONCE_INIT PTHREAD_ONCE_INIT
+typedef struct CRYPTO_once {
+  pthread_once_t once; 
+  int ran_;
+} CRYPTO_once_t;
+#define CRYPTO_ONCE_INIT {PTHREAD_ONCE_INIT, 0}
+
 #else
 #error "Unknown threading library"
 #endif

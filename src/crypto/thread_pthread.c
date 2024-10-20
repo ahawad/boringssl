@@ -52,9 +52,10 @@ union ticketlock {
 };
 
 typedef struct {
-  pthread_mutex_t _mutex;
-  bool _ran;
+  pthread_once_t _once;
+  int _ran;
 } true_pthread_once_t;
+
 
 
 static void ticket_lock(ticketlock *t) {
@@ -124,16 +125,18 @@ void CRYPTO_STATIC_MUTEX_unlock_write(struct CRYPTO_STATIC_MUTEX *lock) {
 }
 
 void CRYPTO_once(CRYPTO_once_t *once, void (*init)(void)) {
+  static_assert(sizeof(CRYPTO_once_t) == sizeof(true_pthread_once_t), "");
   static ticketlock lock = {.u = 0};
 
-  if (((true_pthread_once_t *)once)->_ran) {
+  if (once->ran_) {
     return;
   }
 
   ticket_lock(&lock);
-  if (pthread_once(once, init) != 0) {
+  if (pthread_once(&once->once, init) != 0) {
     abort();
   }
+  once->ran_ = 1;
   ticket_unlock(&lock);
 }
 
@@ -165,7 +168,7 @@ static void thread_local_destructor(void *arg) {
   OPENSSL_free(pointers);
 }
 
-static pthread_once_t g_thread_local_init_once = PTHREAD_ONCE_INIT;
+static CRYPTO_once_t g_thread_local_init_once = CRYPTO_ONCE_INIT;
 static pthread_key_t g_thread_local_key;
 static int g_thread_local_key_created = 0;
 
