@@ -491,7 +491,7 @@ typedef uint32_t CRYPTO_once_t;
 typedef INIT_ONCE CRYPTO_once_t;
 #define CRYPTO_ONCE_INIT INIT_ONCE_STATIC_INIT
 #elif defined(OPENSSL_PTHREADS)
-typedef struct CRYPTO_once {
+typedef struct {
   pthread_once_t once; 
   int ran_;
 } CRYPTO_once_t;
